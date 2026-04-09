@@ -1,5 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
-// Standard UniswapV2-compatible ABIs (minimal)
+// Paragon DEX ABIs — extracted from frontend source
+// NOT standard UniswapV2! Custom router with autoYield param
 // ═══════════════════════════════════════════════════════════════
 
 const ERC20_ABI = [
@@ -13,18 +14,51 @@ const ERC20_ABI = [
   "function transfer(address to, uint256 amount) returns (bool)",
 ];
 
+// ── Paragon Router (custom — NOT standard UniswapV2!) ─────────
+// Key diff: swapExactTokensForTokens has extra `uint8 autoYieldPercent`
+// Uses WNative() instead of WETH()
 const ROUTER_ABI = [
   "function factory() view returns (address)",
-  "function WETH() view returns (address)",
+  "function WNative() view returns (address)",
+  "function masterChef() view returns (address)",
+  "function paused() view returns (bool)",
+  "function owner() view returns (address)",
+
+  // Quotes
+  "function quote(uint256 amountA, uint256 reserveA, uint256 reserveB) pure returns (uint256)",
+  "function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) view returns (uint256)",
+  "function getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut) view returns (uint256)",
+  "function getAmountOutFor(address tokenIn, address tokenOut, uint256 amountIn) view returns (uint256)",
+  "function getAmountInFor(address tokenIn, address tokenOut, uint256 amountOut) view returns (uint256)",
   "function getAmountsOut(uint256 amountIn, address[] path) view returns (uint256[])",
   "function getAmountsIn(uint256 amountOut, address[] path) view returns (uint256[])",
-  "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[])",
-  "function swapExactETHForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) payable returns (uint256[])",
-  "function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[])",
-  "function addLiquidity(address tokenA, address tokenB, uint256 amountADesired, uint256 amountBDesired, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) returns (uint256 amountA, uint256 amountB, uint256 liquidity)",
-  "function addLiquidityETH(address token, uint256 amountTokenDesired, uint256 amountTokenMin, uint256 amountETHMin, address to, uint256 deadline) payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity)",
-  "function removeLiquidity(address tokenA, address tokenB, uint256 liquidity, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) returns (uint256 amountA, uint256 amountB)",
-  "function removeLiquidityETH(address token, uint256 liquidity, uint256 amountTokenMin, uint256 amountETHMin, address to, uint256 deadline) returns (uint256 amountToken, uint256 amountETH)",
+
+  // Swap — note extra autoYieldPercent param!
+  "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline, uint8 autoYieldPercent) returns (uint256[])",
+  "function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline, uint8 autoYieldPercent) returns (uint256)",
+  "function swapTokensForExactTokens(uint256 amountOut, uint256 amountInMax, address[] path, address to, uint256 deadline) returns (uint256[])",
+
+  // Native (BNB) swaps — note extra autoYieldPercent on some
+  "function swapExactNativeForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline, uint8 autoYieldPercent) payable returns (uint256[])",
+  "function swapExactNativeForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline, uint8 autoYieldPercent) payable returns (uint256)",
+  "function swapExactTokensForNative(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[])",
+  "function swapExactTokensForNativeSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256)",
+  "function swapNativeForExactTokens(uint256 amountOut, address[] path, address to, uint256 deadline) payable returns (uint256[])",
+  "function swapTokensForExactNative(uint256 amountOut, uint256 amountInMax, address[] path, address to, uint256 deadline) returns (uint256[])",
+
+  // Liquidity
+  "function addLiquidity(address tokenA, address tokenB, uint256 amountADesired, uint256 amountBDesired, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) returns (uint256, uint256, uint256)",
+  "function addLiquidityNative(address token, uint256 amountTokenDesired, uint256 amountTokenMin, uint256 amountNativeMin, address to, uint256 deadline) payable returns (uint256, uint256, uint256)",
+  "function removeLiquidity(address tokenA, address tokenB, uint256 liquidity, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) returns (uint256, uint256)",
+  "function removeLiquidityNative(address token, uint256 liquidity, uint256 amountTokenMin, uint256 amountNativeMin, address to, uint256 deadline) returns (uint256, uint256)",
+  "function removeLiquidityWithPermit(address tokenA, address tokenB, uint256 liquidity, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline, bool approveMax, uint8 v, bytes32 r, bytes32 s) returns (uint256, uint256)",
+  "function removeLiquidityNativeWithPermit(address token, uint256 liquidity, uint256 amountTokenMin, uint256 amountNativeMin, address to, uint256 deadline, bool approveMax, uint8 v, bytes32 r, bytes32 s) returns (uint256, uint256)",
+
+  // Auto-yield
+  "function autoYieldEnabled() view returns (bool)",
+  "function autoYieldPid() view returns (uint256)",
+  "function userAutoYieldBips(address) view returns (uint8)",
+  "function setAutoYieldPreference(uint8 bips)",
 ];
 
 const FACTORY_ABI = [
@@ -48,27 +82,27 @@ const PAIR_ABI = [
   "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
 ];
 
-// Farm Controller - MasterChef-style ABI (common patterns)
+// ── Paragon Farm Controller (MasterChef-like, custom) ─────────
+// deposit → depositFor(pid, amount, user, referrer)
+// poolInfo returns 7 values
+// userInfo returns 4 values
 const FARM_ABI = [
   "function poolLength() view returns (uint256)",
-  "function poolInfo(uint256 pid) view returns (address lpToken, uint256 allocPoint, uint256 lastRewardBlock, uint256 accRewardPerShare)",
-  "function userInfo(uint256 pid, address user) view returns (uint256 amount, uint256 rewardDebt)",
-  "function pendingReward(uint256 pid, address user) view returns (uint256)",
-  "function pending(uint256 pid, address user) view returns (uint256)",
-  "function pendingXPGN(uint256 pid, address user) view returns (uint256)",
-  "function deposit(uint256 pid, uint256 amount)",
-  "function withdraw(uint256 pid, uint256 amount)",
-  "function harvest(uint256 pid)",
-  "function emergencyWithdraw(uint256 pid)",
-];
-
-// Faucet ABI (common testnet faucet)
-const FAUCET_ABI = [
-  "function claim()",
-  "function claimTokens()",
-  "function drip(address token)",
-  "function faucet()",
-  "function requestTokens()",
+  "function poolInfo(uint256) view returns (address lpToken, uint256 allocPoint, uint256 lastRewardBlock, uint256 accRewardPerShare, uint256 harvestDelay, uint256 totalStaked, uint256 rewardTokenStaked)",
+  "function userInfo(uint256 pid, address user) view returns (uint256 amount, uint256 rewardDebt, uint256 pendingHarvest, uint256 lastDepositBlock)",
+  "function pendingReward(uint256 _pid, address _user) view returns (uint256)",
+  "function pendingRewardAfterFee(uint256 _pid, address _user) view returns (uint256 reward, uint256 fee)",
+  "function claimableRewardAfterFee(uint256 _pid, address _user) view returns (uint256)",
+  "function depositFor(uint256 _pid, uint256 _amount, address _user, address _referrer)",
+  "function withdraw(uint256 _pid, uint256 _amount)",
+  "function harvest(uint256 _pid)",
+  "function emergencyWithdraw(uint256 _pid)",
+  "function rewardToken() view returns (address)",
+  "function rewardPerBlock() view returns (uint256)",
+  "function totalAllocPoint() view returns (uint256)",
+  "function startBlock() view returns (uint256)",
+  "function availableRewards() view returns (uint256)",
+  "function autoYieldDeposited(uint256 pid, address user) view returns (uint256)",
 ];
 
 module.exports = {
@@ -77,5 +111,4 @@ module.exports = {
   FACTORY_ABI,
   PAIR_ABI,
   FARM_ABI,
-  FAUCET_ABI,
 };

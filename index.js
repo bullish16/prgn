@@ -20,9 +20,12 @@ const router   = new ethers.Contract(CFG.ROUTER, ABI.ROUTER_ABI, wallet);
 const factory  = new ethers.Contract(CFG.FACTORY, ABI.FACTORY_ABI, wallet);
 const farm     = new ethers.Contract(CFG.FARM_CONTROLLER, ABI.FARM_ABI, wallet);
 
+// Zero address for referrer (no referral)
+const ZERO_ADDR = ethers.ZeroAddress;
+
 // ── Token helpers ─────────────────────────────────────────────
 function erc20(addr) { return new ethers.Contract(addr, ABI.ERC20_ABI, wallet); }
-function pair(addr)  { return new ethers.Contract(addr, ABI.PAIR_ABI, wallet); }
+function pairContract(addr) { return new ethers.Contract(addr, ABI.PAIR_ABI, wallet); }
 
 const TOKEN_NAME_CACHE = {};
 async function tokenSymbol(addr) {
@@ -34,6 +37,16 @@ async function tokenSymbol(addr) {
   } catch {
     return short(addr);
   }
+}
+
+const TOKEN_DEC_CACHE = {};
+async function tokenDecimals(addr) {
+  if (TOKEN_DEC_CACHE[addr] !== undefined) return TOKEN_DEC_CACHE[addr];
+  try {
+    const dec = Number(await erc20(addr).decimals());
+    TOKEN_DEC_CACHE[addr] = dec;
+    return dec;
+  } catch { return 18; }
 }
 
 // ── Approve helper (approve max if needed) ────────────────────
@@ -58,7 +71,7 @@ async function discoverPairs() {
   const pairs = [];
   for (let i = 0; i < Number(len); i++) {
     const pairAddr = await factory.allPairs(i);
-    const p = pair(pairAddr);
+    const p = pairContract(pairAddr);
     const [t0, t1] = await Promise.all([p.token0(), p.token1()]);
     const [s0, s1] = await Promise.all([tokenSymbol(t0), tokenSymbol(t1)]);
 
@@ -87,7 +100,7 @@ async function mapFarmPools(pairs) {
   for (let pid = 0; pid < Number(poolLen); pid++) {
     try {
       const info = await farm.poolInfo(pid);
-      const lpToken = info[0] ?? info.lpToken;
+      const lpToken = info[0]; // lpToken is first return value
       const match = pairs.find(p => p.address.toLowerCase() === lpToken.toLowerCase());
       if (match) {
         match.pid = pid;
@@ -109,15 +122,28 @@ async function doAddLiquidity(pairs) {
   step("ADD LIQUIDITY");
   for (const p of pairs) {
     console.log(`\n  📊 Pair: ${p.sym0}/${p.sym1}`);
-    const dec0 = await erc20(p.token0).decimals();
-    const dec1 = await erc20(p.token1).decimals();
+    const dec0 = await tokenDecimals(p.token0);
+    const dec1 = await tokenDecimals(p.token1);
 
     for (let i = 1; i <= CFG.REPEAT_COUNT; i++) {
       sub(i, CFG.REPEAT_COUNT, `Adding liquidity ${p.sym0}/${p.sym1}`);
       try {
-        const amtA = liqAmount(p.token0, Number(dec0));
-        const amtB = liqAmount(p.token1, Number(dec1));
-        console.log(`   💰 ${fmt(amtA, Number(dec0))} ${p.sym0} + ${fmt(amtB, Number(dec1))} ${p.sym1}`);
+        // Get reserves to calculate proper ratio
+        const pairC = pairContract(p.address);
+        const reserves = await pairC.getReserves();
+        const r0 = reserves[0];
+        const r1 = reserves[1];
+
+        const amtA = liqAmount(p.token0, dec0);
+        // Calculate amtB based on pool ratio
+        let amtB;
+        try {
+          amtB = await router.quote(amtA, r0, r1);
+        } catch {
+          amtB = liqAmount(p.token1, dec1);
+        }
+
+        console.log(`   💰 ${fmt(amtA, dec0)} ${p.sym0} + ${fmt(amtB, dec1)} ${p.sym1}`);
 
         await ensureApproval(p.token0, CFG.ROUTER, amtA);
         await ensureApproval(p.token1, CFG.ROUTER, amtB);
@@ -132,7 +158,7 @@ async function doAddLiquidity(pairs) {
         const receipt = await tx.wait();
         console.log(`   ✅ Liquidity added! tx: ${short(tx.hash)} (gas: ${receipt.gasUsed})`);
       } catch (e) {
-        console.log(`   ❌ Failed: ${e.shortMessage || e.message?.slice(0, 80)}`);
+        console.log(`   ❌ Failed: ${e.shortMessage || e.message?.slice(0, 120)}`);
       }
       await randomDelay();
     }
@@ -141,20 +167,21 @@ async function doAddLiquidity(pairs) {
 
 // ═══════════════════════════════════════════════════════════════
 //  STEP 2: SWAP (5× per pair, both directions)
+//  NOTE: autoYieldPercent = 0 (no auto-yield)
 // ═══════════════════════════════════════════════════════════════
 async function doSwap(pairs) {
   step("SWAP");
   for (const p of pairs) {
     console.log(`\n  📊 Pair: ${p.sym0}/${p.sym1}`);
-    const dec0 = await erc20(p.token0).decimals();
-    const dec1 = await erc20(p.token1).decimals();
+    const dec0 = await tokenDecimals(p.token0);
+    const dec1 = await tokenDecimals(p.token1);
 
     for (let i = 1; i <= CFG.REPEAT_COUNT; i++) {
       // Alternate direction: odd = 0→1, even = 1→0
       const forward = i % 2 === 1;
       const [fromToken, toToken] = forward ? [p.token0, p.token1] : [p.token1, p.token0];
       const [fromSym, toSym]     = forward ? [p.sym0, p.sym1]     : [p.sym1, p.sym0];
-      const fromDec = forward ? Number(dec0) : Number(dec1);
+      const fromDec = forward ? dec0 : dec1;
 
       sub(i, CFG.REPEAT_COUNT, `Swap ${fromSym} → ${toSym}`);
       try {
@@ -169,19 +196,21 @@ async function doSwap(pairs) {
           const amounts = await router.getAmountsOut(amtIn, [fromToken, toToken]);
           amtOutMin = withSlippage(amounts[1]);
         } catch {
-          amtOutMin = 0n; // fallback: accept any output
+          amtOutMin = 0n;
         }
 
+        // Paragon swap: extra param autoYieldPercent = 0
         const tx = await router.swapExactTokensForTokens(
           amtIn, amtOutMin,
           [fromToken, toToken],
           wallet.address, deadline(),
+          0,  // autoYieldPercent
           { gasLimit: CFG.GAS_LIMIT }
         );
         const receipt = await tx.wait();
         console.log(`   ✅ Swapped! tx: ${short(tx.hash)} (gas: ${receipt.gasUsed})`);
       } catch (e) {
-        console.log(`   ❌ Failed: ${e.shortMessage || e.message?.slice(0, 80)}`);
+        console.log(`   ❌ Failed: ${e.shortMessage || e.message?.slice(0, 120)}`);
       }
       await randomDelay();
     }
@@ -202,17 +231,17 @@ async function doZapAndStake(pairs) {
 
   for (const p of farmPairs) {
     console.log(`\n  📊 Pair: ${p.sym0}/${p.sym1} (Farm PID: ${p.pid})`);
-    const dec0 = await erc20(p.token0).decimals();
-    const dec1 = await erc20(p.token1).decimals();
+    const dec0 = await tokenDecimals(p.token0);
+    const dec1 = await tokenDecimals(p.token1);
 
     for (let i = 1; i <= CFG.REPEAT_COUNT; i++) {
       sub(i, CFG.REPEAT_COUNT, `Zap & Stake ${p.sym0}/${p.sym1}`);
       try {
         // 1) Take a random amount of token0
-        const totalAmt = liqAmount(p.token0, Number(dec0));
+        const totalAmt = liqAmount(p.token0, dec0);
         const halfAmt  = totalAmt / 2n;
 
-        console.log(`   🔄 Zap: swap ${fmt(halfAmt, Number(dec0))} ${p.sym0} → ${p.sym1}`);
+        console.log(`   🔄 Zap: swap ${fmt(halfAmt, dec0)} ${p.sym0} → ${p.sym1}`);
         await ensureApproval(p.token0, CFG.ROUTER, totalAmt);
 
         // 2) Swap half to token1
@@ -224,12 +253,13 @@ async function doZapAndStake(pairs) {
             halfAmt, withSlippage(receivedB),
             [p.token0, p.token1],
             wallet.address, deadline(),
+            0,  // autoYieldPercent
             { gasLimit: CFG.GAS_LIMIT }
           );
           await txSwap.wait();
           console.log(`   ✅ Zap swap done`);
         } catch (e) {
-          console.log(`   ❌ Zap swap failed: ${e.shortMessage || e.message?.slice(0, 60)}`);
+          console.log(`   ❌ Zap swap failed: ${e.shortMessage || e.message?.slice(0, 80)}`);
           await randomDelay();
           continue;
         }
@@ -237,11 +267,20 @@ async function doZapAndStake(pairs) {
 
         // 3) Add liquidity with remaining half + received
         const remainA = halfAmt;
-        const addB    = withSlippage(receivedB); // use slightly less to be safe
-        console.log(`   💧 Adding liquidity: ${fmt(remainA, Number(dec0))} ${p.sym0} + ${fmt(addB, Number(dec1))} ${p.sym1}`);
+        // Re-quote for correct ratio
+        let addB;
+        try {
+          const pairC = pairContract(p.address);
+          const reserves = await pairC.getReserves();
+          addB = await router.quote(remainA, reserves[0], reserves[1]);
+        } catch {
+          addB = withSlippage(receivedB);
+        }
+
+        console.log(`   💧 Adding liquidity: ${fmt(remainA, dec0)} ${p.sym0} + ${fmt(addB, dec1)} ${p.sym1}`);
         await ensureApproval(p.token1, CFG.ROUTER, addB);
 
-        let lpReceived = 0n;
+        const lpBefore = await pairContract(p.address).balanceOf(wallet.address);
         try {
           const txLp = await router.addLiquidity(
             p.token0, p.token1,
@@ -251,29 +290,31 @@ async function doZapAndStake(pairs) {
             { gasLimit: CFG.GAS_LIMIT }
           );
           await txLp.wait();
-          lpReceived = await pair(p.address).balanceOf(wallet.address);
+          const lpAfter = await pairContract(p.address).balanceOf(wallet.address);
+          const lpReceived = lpAfter - lpBefore;
           console.log(`   ✅ LP received: ${fmt(lpReceived)}`);
-        } catch (e) {
-          console.log(`   ❌ AddLiquidity failed: ${e.shortMessage || e.message?.slice(0, 60)}`);
-          await randomDelay();
-          continue;
-        }
-        await randomDelay();
 
-        // 4) Stake LP in farm
-        if (lpReceived > 0n) {
-          console.log(`   🌾 Staking LP in Farm PID ${p.pid}...`);
-          await ensureApproval(p.address, CFG.FARM_CONTROLLER, lpReceived);
-          try {
-            const txStake = await farm.deposit(p.pid, lpReceived, { gasLimit: CFG.GAS_LIMIT });
-            await txStake.wait();
-            console.log(`   ✅ Staked! tx: ${short(txStake.hash)}`);
-          } catch (e) {
-            console.log(`   ❌ Stake failed: ${e.shortMessage || e.message?.slice(0, 60)}`);
+          // 4) Stake LP in farm using depositFor
+          if (lpReceived > 0n) {
+            console.log(`   🌾 Staking LP in Farm PID ${p.pid}...`);
+            await ensureApproval(p.address, CFG.FARM_CONTROLLER, lpReceived);
+            await randomDelay();
+            try {
+              const txStake = await farm.depositFor(
+                p.pid, lpReceived, wallet.address, ZERO_ADDR,
+                { gasLimit: CFG.GAS_LIMIT }
+              );
+              await txStake.wait();
+              console.log(`   ✅ Staked! tx: ${short(txStake.hash)}`);
+            } catch (e) {
+              console.log(`   ❌ Stake failed: ${e.shortMessage || e.message?.slice(0, 80)}`);
+            }
           }
+        } catch (e) {
+          console.log(`   ❌ AddLiquidity failed: ${e.shortMessage || e.message?.slice(0, 80)}`);
         }
       } catch (e) {
-        console.log(`   ❌ ZapStake error: ${e.shortMessage || e.message?.slice(0, 80)}`);
+        console.log(`   ❌ ZapStake error: ${e.shortMessage || e.message?.slice(0, 120)}`);
       }
       await randomDelay();
     }
@@ -299,27 +340,17 @@ async function doEarn(pairs) {
       try {
         // Check pending rewards
         let pending = 0n;
-        for (const fn of ["pendingXPGN", "pendingReward", "pending"]) {
-          try {
-            pending = await farm[fn](p.pid, wallet.address);
-            break;
-          } catch {}
-        }
+        try {
+          pending = await farm.pendingReward(p.pid, wallet.address);
+        } catch {}
         console.log(`   🎁 Pending reward: ${fmt(pending)} XPGN`);
 
-        // Harvest by depositing 0
-        const tx = await farm.deposit(p.pid, 0n, { gasLimit: CFG.GAS_LIMIT });
+        // Harvest using explicit harvest() function
+        const tx = await farm.harvest(p.pid, { gasLimit: CFG.GAS_LIMIT });
         await tx.wait();
         console.log(`   ✅ Harvested! tx: ${short(tx.hash)}`);
       } catch (e) {
-        // Try explicit harvest function
-        try {
-          const tx = await farm.harvest(p.pid, { gasLimit: CFG.GAS_LIMIT });
-          await tx.wait();
-          console.log(`   ✅ Harvested (explicit)! tx: ${short(tx.hash)}`);
-        } catch (e2) {
-          console.log(`   ❌ Harvest failed: ${e2.shortMessage || e2.message?.slice(0, 60)}`);
-        }
+        console.log(`   ❌ Harvest failed: ${e.shortMessage || e.message?.slice(0, 120)}`);
       }
       await randomDelay();
     }
@@ -341,10 +372,11 @@ async function doRemoveLiquidity(pairs) {
         if (p.pid !== null) {
           try {
             const info = await farm.userInfo(p.pid, wallet.address);
-            const staked = info[0] ?? info.amount;
+            const staked = info[0]; // amount is first return value
             if (staked > 0n) {
-              // Withdraw 1/5th each time (or all on last iteration)
-              const withdrawAmt = i === CFG.REPEAT_COUNT ? staked : staked / BigInt(CFG.REPEAT_COUNT - i + 1);
+              // Withdraw portion: 1/remaining each time
+              const remaining = CFG.REPEAT_COUNT - i + 1;
+              const withdrawAmt = i === CFG.REPEAT_COUNT ? staked : staked / BigInt(remaining);
               console.log(`   🌾 Unstaking ${fmt(withdrawAmt)} LP from Farm PID ${p.pid}`);
               const txW = await farm.withdraw(p.pid, withdrawAmt, { gasLimit: CFG.GAS_LIMIT });
               await txW.wait();
@@ -352,20 +384,21 @@ async function doRemoveLiquidity(pairs) {
               await randomDelay();
             }
           } catch (e) {
-            console.log(`   ⚠️  Unstake check failed: ${e.message?.slice(0, 50)}`);
+            console.log(`   ⚠️  Unstake failed: ${e.shortMessage || e.message?.slice(0, 60)}`);
           }
         }
 
         // Get LP balance
-        const lp = pair(p.address);
+        const lp = pairContract(p.address);
         const lpBal = await lp.balanceOf(wallet.address);
         if (lpBal === 0n) {
           console.log(`   ⚠️  No LP balance, skipping`);
           continue;
         }
 
-        // Remove 1/5th each time (or all remaining on last iter)
-        const removeAmt = i === CFG.REPEAT_COUNT ? lpBal : lpBal / BigInt(CFG.REPEAT_COUNT - i + 1);
+        // Remove portion each time
+        const remaining = CFG.REPEAT_COUNT - i + 1;
+        const removeAmt = i === CFG.REPEAT_COUNT ? lpBal : lpBal / BigInt(remaining);
         console.log(`   🔥 Removing ${fmt(removeAmt)} LP`);
 
         await ensureApproval(p.address, CFG.ROUTER, removeAmt);
@@ -380,7 +413,7 @@ async function doRemoveLiquidity(pairs) {
         const receipt = await tx.wait();
         console.log(`   ✅ Liquidity removed! tx: ${short(tx.hash)} (gas: ${receipt.gasUsed})`);
       } catch (e) {
-        console.log(`   ❌ Failed: ${e.shortMessage || e.message?.slice(0, 80)}`);
+        console.log(`   ❌ Failed: ${e.shortMessage || e.message?.slice(0, 120)}`);
       }
       await randomDelay();
     }
@@ -406,6 +439,16 @@ async function main() {
     process.exit(1);
   }
 
+  // Verify router is not paused
+  try {
+    const paused = await router.paused();
+    if (paused) {
+      console.log("\n  ❌ Router is PAUSED! Cannot execute transactions.");
+      process.exit(1);
+    }
+    console.log("  ✅ Router is active (not paused)");
+  } catch {}
+
   // Check token balances
   console.log("\n  Token balances:");
   const tokenList = [
@@ -415,10 +458,10 @@ async function main() {
   for (const [name, addr] of tokenList) {
     try {
       const bal = await erc20(addr).balanceOf(wallet.address);
-      const dec = await erc20(addr).decimals();
-      console.log(`    ${name}: ${fmt(bal, Number(dec))}`);
+      const dec = await tokenDecimals(addr);
+      console.log(`    ${name.padEnd(6)}: ${fmt(bal, dec)}`);
     } catch {
-      console.log(`    ${name}: (read error)`);
+      console.log(`    ${name.padEnd(6)}: (read error)`);
     }
   }
 
