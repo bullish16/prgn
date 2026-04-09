@@ -10,7 +10,7 @@ const CFG   = require("./config");
 const ABI   = require("./abi");
 const {
   randomDelay, randomAmount, deadline, withSlippage,
-  fmt, short, step, sub,
+  fmt, short, step, sub, isStable, swapAmount, liqAmount,
 } = require("./utils");
 
 // ── Setup ─────────────────────────────────────────────────────
@@ -115,8 +115,8 @@ async function doAddLiquidity(pairs) {
     for (let i = 1; i <= CFG.REPEAT_COUNT; i++) {
       sub(i, CFG.REPEAT_COUNT, `Adding liquidity ${p.sym0}/${p.sym1}`);
       try {
-        const amtA = randomAmount(CFG.LIQUIDITY_AMOUNT_MIN, CFG.LIQUIDITY_AMOUNT_MAX, Number(dec0));
-        const amtB = randomAmount(CFG.LIQUIDITY_AMOUNT_MIN, CFG.LIQUIDITY_AMOUNT_MAX, Number(dec1));
+        const amtA = liqAmount(p.token0, Number(dec0));
+        const amtB = liqAmount(p.token1, Number(dec1));
         console.log(`   💰 ${fmt(amtA, Number(dec0))} ${p.sym0} + ${fmt(amtB, Number(dec1))} ${p.sym1}`);
 
         await ensureApproval(p.token0, CFG.ROUTER, amtA);
@@ -158,7 +158,7 @@ async function doSwap(pairs) {
 
       sub(i, CFG.REPEAT_COUNT, `Swap ${fromSym} → ${toSym}`);
       try {
-        const amtIn = randomAmount(CFG.SWAP_AMOUNT_MIN, CFG.SWAP_AMOUNT_MAX, fromDec);
+        const amtIn = swapAmount(fromToken, fromDec);
         console.log(`   💱 ${fmt(amtIn, fromDec)} ${fromSym} → ${toSym}`);
 
         await ensureApproval(fromToken, CFG.ROUTER, amtIn);
@@ -209,7 +209,7 @@ async function doZapAndStake(pairs) {
       sub(i, CFG.REPEAT_COUNT, `Zap & Stake ${p.sym0}/${p.sym1}`);
       try {
         // 1) Take a random amount of token0
-        const totalAmt = randomAmount(CFG.LIQUIDITY_AMOUNT_MIN, CFG.LIQUIDITY_AMOUNT_MAX, Number(dec0));
+        const totalAmt = liqAmount(p.token0, Number(dec0));
         const halfAmt  = totalAmt / 2n;
 
         console.log(`   🔄 Zap: swap ${fmt(halfAmt, Number(dec0))} ${p.sym0} → ${p.sym1}`);

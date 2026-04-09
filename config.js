@@ -42,9 +42,21 @@ module.exports = {
   DELAY_MAX_MS: 15_000,         // max delay between tx (15s)
 
   // ── Random Amount Ranges (in token units, NOT wei) ──────────
-  // Small random amounts per tx — will pick random between min & max
+  // Default small amounts for non-stablecoin tokens
   SWAP_AMOUNT_MIN: "0.0003",
   SWAP_AMOUNT_MAX: "0.0012",
   LIQUIDITY_AMOUNT_MIN: "0.0002",
   LIQUIDITY_AMOUNT_MAX: "0.001",
+
+  // Stablecoin amounts (USDC/USDT) → random 1-10
+  STABLE_SWAP_AMOUNT_MIN: "1",
+  STABLE_SWAP_AMOUNT_MAX: "10",
+  STABLE_LIQUIDITY_AMOUNT_MIN: "1",
+  STABLE_LIQUIDITY_AMOUNT_MAX: "10",
+
+  // Stablecoin addresses (lowercase for matching)
+  STABLECOINS: [
+    "0x6ef1f996008b0ef1f29aa1bf67c59747713f760d",  // USDT
+    "0xd786fe32daf619fb772daedce24eb66a8e48b3c2",  // USDC
+  ],
 };

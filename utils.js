@@ -57,6 +57,27 @@ function sub(iter, total, msg) {
   console.log(`\n  [${iter}/${total}] ${msg}`);
 }
 
+/** Check if a token address is a stablecoin (USDT/USDC) */
+function isStable(addr) {
+  return CFG.STABLECOINS.includes(addr.toLowerCase());
+}
+
+/** Get the right swap amount range for a token */
+function swapAmount(tokenAddr, decimals) {
+  if (isStable(tokenAddr)) {
+    return randomAmount(CFG.STABLE_SWAP_AMOUNT_MIN, CFG.STABLE_SWAP_AMOUNT_MAX, decimals);
+  }
+  return randomAmount(CFG.SWAP_AMOUNT_MIN, CFG.SWAP_AMOUNT_MAX, decimals);
+}
+
+/** Get the right liquidity amount range for a token */
+function liqAmount(tokenAddr, decimals) {
+  if (isStable(tokenAddr)) {
+    return randomAmount(CFG.STABLE_LIQUIDITY_AMOUNT_MIN, CFG.STABLE_LIQUIDITY_AMOUNT_MAX, decimals);
+  }
+  return randomAmount(CFG.LIQUIDITY_AMOUNT_MIN, CFG.LIQUIDITY_AMOUNT_MAX, decimals);
+}
+
 module.exports = {
   randomDelay,
   randomAmount,
@@ -66,4 +87,7 @@ module.exports = {
   short,
   step,
   sub,
+  isStable,
+  swapAmount,
+  liqAmount,
 };
