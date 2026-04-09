@@ -1,0 +1,455 @@
+#!/usr/bin/env node
+// ═══════════════════════════════════════════════════════════════
+//  Paragon DEX Testnet Bot
+//  Order: Add Liquidity → Swap → Zap & Stake → Earn → Remove Liquidity
+//  5× per pair, random small amounts, 7-15s delay
+// ═══════════════════════════════════════════════════════════════
+require("dotenv").config();
+const { ethers } = require("ethers");
+const CFG   = require("./config");
+const ABI   = require("./abi");
+const {
+  randomDelay, randomAmount, deadline, withSlippage,
+  fmt, short, step, sub,
+} = require("./utils");
+
+// ── Setup ─────────────────────────────────────────────────────
+const provider = new ethers.JsonRpcProvider(CFG.RPC_URL, CFG.CHAIN_ID);
+const wallet   = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+const router   = new ethers.Contract(CFG.ROUTER, ABI.ROUTER_ABI, wallet);
+const factory  = new ethers.Contract(CFG.FACTORY, ABI.FACTORY_ABI, wallet);
+const farm     = new ethers.Contract(CFG.FARM_CONTROLLER, ABI.FARM_ABI, wallet);
+
+// ── Token helpers ─────────────────────────────────────────────
+function erc20(addr) { return new ethers.Contract(addr, ABI.ERC20_ABI, wallet); }
+function pair(addr)  { return new ethers.Contract(addr, ABI.PAIR_ABI, wallet); }
+
+const TOKEN_NAME_CACHE = {};
+async function tokenSymbol(addr) {
+  if (TOKEN_NAME_CACHE[addr]) return TOKEN_NAME_CACHE[addr];
+  try {
+    const sym = await erc20(addr).symbol();
+    TOKEN_NAME_CACHE[addr] = sym;
+    return sym;
+  } catch {
+    return short(addr);
+  }
+}
+
+// ── Approve helper (approve max if needed) ────────────────────
+async function ensureApproval(tokenAddr, spender, amount) {
+  const token = erc20(tokenAddr);
+  const sym = await tokenSymbol(tokenAddr);
+  const allowance = await token.allowance(wallet.address, spender);
+  if (allowance >= amount) return;
+  console.log(`   🔓 Approving ${sym} for ${short(spender)}...`);
+  const tx = await token.approve(spender, ethers.MaxUint256, { gasLimit: CFG.GAS_LIMIT });
+  await tx.wait();
+  console.log(`   ✅ Approved (tx: ${short(tx.hash)})`);
+  await randomDelay();
+}
+
+// ── Discover pairs from factory ───────────────────────────────
+async function discoverPairs() {
+  console.log("\n🔍 Discovering pairs from factory...");
+  const len = await factory.allPairsLength();
+  console.log(`   Found ${len} pairs on-chain`);
+
+  const pairs = [];
+  for (let i = 0; i < Number(len); i++) {
+    const pairAddr = await factory.allPairs(i);
+    const p = pair(pairAddr);
+    const [t0, t1] = await Promise.all([p.token0(), p.token1()]);
+    const [s0, s1] = await Promise.all([tokenSymbol(t0), tokenSymbol(t1)]);
+
+    // Check reserves — skip empty pools
+    try {
+      const res = await p.getReserves();
+      if (res[0] === 0n && res[1] === 0n) {
+        console.log(`   ⚠️  Pair #${i} ${s0}/${s1} — empty, skipping`);
+        continue;
+      }
+    } catch { continue; }
+
+    pairs.push({ address: pairAddr, token0: t0, token1: t1, sym0: s0, sym1: s1, pid: null });
+    console.log(`   ✅ Pair #${i}: ${s0}/${s1} (${short(pairAddr)})`);
+  }
+  return pairs;
+}
+
+// ── Discover farm pools and map to LP pair addresses ──────────
+async function mapFarmPools(pairs) {
+  console.log("\n🌾 Discovering farm pools...");
+  let poolLen;
+  try { poolLen = await farm.poolLength(); } catch { console.log("   ⚠️  Could not read poolLength, skipping farm mapping"); return pairs; }
+
+  console.log(`   Found ${poolLen} farm pools`);
+  for (let pid = 0; pid < Number(poolLen); pid++) {
+    try {
+      const info = await farm.poolInfo(pid);
+      const lpToken = info[0] ?? info.lpToken;
+      const match = pairs.find(p => p.address.toLowerCase() === lpToken.toLowerCase());
+      if (match) {
+        match.pid = pid;
+        console.log(`   ✅ Pool #${pid} → ${match.sym0}/${match.sym1}`);
+      } else {
+        console.log(`   ℹ️  Pool #${pid} LP ${short(lpToken)} — no matching pair`);
+      }
+    } catch (e) {
+      console.log(`   ⚠️  Pool #${pid} read failed: ${e.message?.slice(0, 60)}`);
+    }
+  }
+  return pairs;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  STEP 1: ADD LIQUIDITY (5× per pair)
+// ═══════════════════════════════════════════════════════════════
+async function doAddLiquidity(pairs) {
+  step("ADD LIQUIDITY");
+  for (const p of pairs) {
+    console.log(`\n  📊 Pair: ${p.sym0}/${p.sym1}`);
+    const dec0 = await erc20(p.token0).decimals();
+    const dec1 = await erc20(p.token1).decimals();
+
+    for (let i = 1; i <= CFG.REPEAT_COUNT; i++) {
+      sub(i, CFG.REPEAT_COUNT, `Adding liquidity ${p.sym0}/${p.sym1}`);
+      try {
+        const amtA = randomAmount(CFG.LIQUIDITY_AMOUNT_MIN, CFG.LIQUIDITY_AMOUNT_MAX, Number(dec0));
+        const amtB = randomAmount(CFG.LIQUIDITY_AMOUNT_MIN, CFG.LIQUIDITY_AMOUNT_MAX, Number(dec1));
+        console.log(`   💰 ${fmt(amtA, Number(dec0))} ${p.sym0} + ${fmt(amtB, Number(dec1))} ${p.sym1}`);
+
+        await ensureApproval(p.token0, CFG.ROUTER, amtA);
+        await ensureApproval(p.token1, CFG.ROUTER, amtB);
+
+        const tx = await router.addLiquidity(
+          p.token0, p.token1,
+          amtA, amtB,
+          withSlippage(amtA), withSlippage(amtB),
+          wallet.address, deadline(),
+          { gasLimit: CFG.GAS_LIMIT }
+        );
+        const receipt = await tx.wait();
+        console.log(`   ✅ Liquidity added! tx: ${short(tx.hash)} (gas: ${receipt.gasUsed})`);
+      } catch (e) {
+        console.log(`   ❌ Failed: ${e.shortMessage || e.message?.slice(0, 80)}`);
+      }
+      await randomDelay();
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  STEP 2: SWAP (5× per pair, both directions)
+// ═══════════════════════════════════════════════════════════════
+async function doSwap(pairs) {
+  step("SWAP");
+  for (const p of pairs) {
+    console.log(`\n  📊 Pair: ${p.sym0}/${p.sym1}`);
+    const dec0 = await erc20(p.token0).decimals();
+    const dec1 = await erc20(p.token1).decimals();
+
+    for (let i = 1; i <= CFG.REPEAT_COUNT; i++) {
+      // Alternate direction: odd = 0→1, even = 1→0
+      const forward = i % 2 === 1;
+      const [fromToken, toToken] = forward ? [p.token0, p.token1] : [p.token1, p.token0];
+      const [fromSym, toSym]     = forward ? [p.sym0, p.sym1]     : [p.sym1, p.sym0];
+      const fromDec = forward ? Number(dec0) : Number(dec1);
+
+      sub(i, CFG.REPEAT_COUNT, `Swap ${fromSym} → ${toSym}`);
+      try {
+        const amtIn = randomAmount(CFG.SWAP_AMOUNT_MIN, CFG.SWAP_AMOUNT_MAX, fromDec);
+        console.log(`   💱 ${fmt(amtIn, fromDec)} ${fromSym} → ${toSym}`);
+
+        await ensureApproval(fromToken, CFG.ROUTER, amtIn);
+
+        // Get expected output
+        let amtOutMin;
+        try {
+          const amounts = await router.getAmountsOut(amtIn, [fromToken, toToken]);
+          amtOutMin = withSlippage(amounts[1]);
+        } catch {
+          amtOutMin = 0n; // fallback: accept any output
+        }
+
+        const tx = await router.swapExactTokensForTokens(
+          amtIn, amtOutMin,
+          [fromToken, toToken],
+          wallet.address, deadline(),
+          { gasLimit: CFG.GAS_LIMIT }
+        );
+        const receipt = await tx.wait();
+        console.log(`   ✅ Swapped! tx: ${short(tx.hash)} (gas: ${receipt.gasUsed})`);
+      } catch (e) {
+        console.log(`   ❌ Failed: ${e.shortMessage || e.message?.slice(0, 80)}`);
+      }
+      await randomDelay();
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  STEP 3: ZAP & STAKE (5× per pair with farm pool)
+//  Zap = swap half of tokenA into tokenB, then addLiquidity, then stake LP
+// ═══════════════════════════════════════════════════════════════
+async function doZapAndStake(pairs) {
+  step("ZAP & STAKE");
+  const farmPairs = pairs.filter(p => p.pid !== null);
+  if (farmPairs.length === 0) {
+    console.log("  ⚠️  No farm pools found, skipping Zap & Stake");
+    return;
+  }
+
+  for (const p of farmPairs) {
+    console.log(`\n  📊 Pair: ${p.sym0}/${p.sym1} (Farm PID: ${p.pid})`);
+    const dec0 = await erc20(p.token0).decimals();
+    const dec1 = await erc20(p.token1).decimals();
+
+    for (let i = 1; i <= CFG.REPEAT_COUNT; i++) {
+      sub(i, CFG.REPEAT_COUNT, `Zap & Stake ${p.sym0}/${p.sym1}`);
+      try {
+        // 1) Take a random amount of token0
+        const totalAmt = randomAmount(CFG.LIQUIDITY_AMOUNT_MIN, CFG.LIQUIDITY_AMOUNT_MAX, Number(dec0));
+        const halfAmt  = totalAmt / 2n;
+
+        console.log(`   🔄 Zap: swap ${fmt(halfAmt, Number(dec0))} ${p.sym0} → ${p.sym1}`);
+        await ensureApproval(p.token0, CFG.ROUTER, totalAmt);
+
+        // 2) Swap half to token1
+        let receivedB;
+        try {
+          const amounts = await router.getAmountsOut(halfAmt, [p.token0, p.token1]);
+          receivedB = amounts[1];
+          const txSwap = await router.swapExactTokensForTokens(
+            halfAmt, withSlippage(receivedB),
+            [p.token0, p.token1],
+            wallet.address, deadline(),
+            { gasLimit: CFG.GAS_LIMIT }
+          );
+          await txSwap.wait();
+          console.log(`   ✅ Zap swap done`);
+        } catch (e) {
+          console.log(`   ❌ Zap swap failed: ${e.shortMessage || e.message?.slice(0, 60)}`);
+          await randomDelay();
+          continue;
+        }
+        await randomDelay();
+
+        // 3) Add liquidity with remaining half + received
+        const remainA = halfAmt;
+        const addB    = withSlippage(receivedB); // use slightly less to be safe
+        console.log(`   💧 Adding liquidity: ${fmt(remainA, Number(dec0))} ${p.sym0} + ${fmt(addB, Number(dec1))} ${p.sym1}`);
+        await ensureApproval(p.token1, CFG.ROUTER, addB);
+
+        let lpReceived = 0n;
+        try {
+          const txLp = await router.addLiquidity(
+            p.token0, p.token1,
+            remainA, addB,
+            withSlippage(remainA), withSlippage(addB),
+            wallet.address, deadline(),
+            { gasLimit: CFG.GAS_LIMIT }
+          );
+          await txLp.wait();
+          lpReceived = await pair(p.address).balanceOf(wallet.address);
+          console.log(`   ✅ LP received: ${fmt(lpReceived)}`);
+        } catch (e) {
+          console.log(`   ❌ AddLiquidity failed: ${e.shortMessage || e.message?.slice(0, 60)}`);
+          await randomDelay();
+          continue;
+        }
+        await randomDelay();
+
+        // 4) Stake LP in farm
+        if (lpReceived > 0n) {
+          console.log(`   🌾 Staking LP in Farm PID ${p.pid}...`);
+          await ensureApproval(p.address, CFG.FARM_CONTROLLER, lpReceived);
+          try {
+            const txStake = await farm.deposit(p.pid, lpReceived, { gasLimit: CFG.GAS_LIMIT });
+            await txStake.wait();
+            console.log(`   ✅ Staked! tx: ${short(txStake.hash)}`);
+          } catch (e) {
+            console.log(`   ❌ Stake failed: ${e.shortMessage || e.message?.slice(0, 60)}`);
+          }
+        }
+      } catch (e) {
+        console.log(`   ❌ ZapStake error: ${e.shortMessage || e.message?.slice(0, 80)}`);
+      }
+      await randomDelay();
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  STEP 4: EARN / HARVEST (5× per pair with farm pool)
+// ═══════════════════════════════════════════════════════════════
+async function doEarn(pairs) {
+  step("EARN (HARVEST REWARDS)");
+  const farmPairs = pairs.filter(p => p.pid !== null);
+  if (farmPairs.length === 0) {
+    console.log("  ⚠️  No farm pools found, skipping Earn");
+    return;
+  }
+
+  for (const p of farmPairs) {
+    console.log(`\n  📊 Pair: ${p.sym0}/${p.sym1} (Farm PID: ${p.pid})`);
+
+    for (let i = 1; i <= CFG.REPEAT_COUNT; i++) {
+      sub(i, CFG.REPEAT_COUNT, `Harvest ${p.sym0}/${p.sym1}`);
+      try {
+        // Check pending rewards
+        let pending = 0n;
+        for (const fn of ["pendingXPGN", "pendingReward", "pending"]) {
+          try {
+            pending = await farm[fn](p.pid, wallet.address);
+            break;
+          } catch {}
+        }
+        console.log(`   🎁 Pending reward: ${fmt(pending)} XPGN`);
+
+        // Harvest by depositing 0
+        const tx = await farm.deposit(p.pid, 0n, { gasLimit: CFG.GAS_LIMIT });
+        await tx.wait();
+        console.log(`   ✅ Harvested! tx: ${short(tx.hash)}`);
+      } catch (e) {
+        // Try explicit harvest function
+        try {
+          const tx = await farm.harvest(p.pid, { gasLimit: CFG.GAS_LIMIT });
+          await tx.wait();
+          console.log(`   ✅ Harvested (explicit)! tx: ${short(tx.hash)}`);
+        } catch (e2) {
+          console.log(`   ❌ Harvest failed: ${e2.shortMessage || e2.message?.slice(0, 60)}`);
+        }
+      }
+      await randomDelay();
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  STEP 5: REMOVE LIQUIDITY (5× per pair)
+// ═══════════════════════════════════════════════════════════════
+async function doRemoveLiquidity(pairs) {
+  step("REMOVE LIQUIDITY");
+  for (const p of pairs) {
+    console.log(`\n  📊 Pair: ${p.sym0}/${p.sym1}`);
+
+    for (let i = 1; i <= CFG.REPEAT_COUNT; i++) {
+      sub(i, CFG.REPEAT_COUNT, `Remove liquidity ${p.sym0}/${p.sym1}`);
+      try {
+        // First unstake from farm if staked
+        if (p.pid !== null) {
+          try {
+            const info = await farm.userInfo(p.pid, wallet.address);
+            const staked = info[0] ?? info.amount;
+            if (staked > 0n) {
+              // Withdraw 1/5th each time (or all on last iteration)
+              const withdrawAmt = i === CFG.REPEAT_COUNT ? staked : staked / BigInt(CFG.REPEAT_COUNT - i + 1);
+              console.log(`   🌾 Unstaking ${fmt(withdrawAmt)} LP from Farm PID ${p.pid}`);
+              const txW = await farm.withdraw(p.pid, withdrawAmt, { gasLimit: CFG.GAS_LIMIT });
+              await txW.wait();
+              console.log(`   ✅ Unstaked`);
+              await randomDelay();
+            }
+          } catch (e) {
+            console.log(`   ⚠️  Unstake check failed: ${e.message?.slice(0, 50)}`);
+          }
+        }
+
+        // Get LP balance
+        const lp = pair(p.address);
+        const lpBal = await lp.balanceOf(wallet.address);
+        if (lpBal === 0n) {
+          console.log(`   ⚠️  No LP balance, skipping`);
+          continue;
+        }
+
+        // Remove 1/5th each time (or all remaining on last iter)
+        const removeAmt = i === CFG.REPEAT_COUNT ? lpBal : lpBal / BigInt(CFG.REPEAT_COUNT - i + 1);
+        console.log(`   🔥 Removing ${fmt(removeAmt)} LP`);
+
+        await ensureApproval(p.address, CFG.ROUTER, removeAmt);
+
+        const tx = await router.removeLiquidity(
+          p.token0, p.token1,
+          removeAmt,
+          0n, 0n, // accept any amount back (testnet)
+          wallet.address, deadline(),
+          { gasLimit: CFG.GAS_LIMIT }
+        );
+        const receipt = await tx.wait();
+        console.log(`   ✅ Liquidity removed! tx: ${short(tx.hash)} (gas: ${receipt.gasUsed})`);
+      } catch (e) {
+        console.log(`   ❌ Failed: ${e.shortMessage || e.message?.slice(0, 80)}`);
+      }
+      await randomDelay();
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MAIN
+// ═══════════════════════════════════════════════════════════════
+async function main() {
+  console.log("╔══════════════════════════════════════════════════════════╗");
+  console.log("║         PARAGON DEX TESTNET BOT  🚀                    ║");
+  console.log("║  Add Liq → Swap → Zap&Stake → Earn → Remove Liq       ║");
+  console.log("║  5× per pair · random amounts · 7-15s delay            ║");
+  console.log("╚══════════════════════════════════════════════════════════╝");
+
+  console.log(`\n  Wallet: ${wallet.address}`);
+  const balance = await provider.getBalance(wallet.address);
+  console.log(`  BNB Balance: ${ethers.formatEther(balance)} tBNB`);
+
+  if (balance === 0n) {
+    console.log("\n  ❌ No tBNB! Get testnet BNB from https://testnet.bnbchain.org/faucet-smart");
+    process.exit(1);
+  }
+
+  // Check token balances
+  console.log("\n  Token balances:");
+  const tokenList = [
+    ["WBNB", CFG.WBNB], ["USDT", CFG.USDT], ["USDC", CFG.USDC],
+    ["XPGN", CFG.XPGN], ["ETH", CFG.ETH], ["BTC", CFG.BTC],
+  ];
+  for (const [name, addr] of tokenList) {
+    try {
+      const bal = await erc20(addr).balanceOf(wallet.address);
+      const dec = await erc20(addr).decimals();
+      console.log(`    ${name}: ${fmt(bal, Number(dec))}`);
+    } catch {
+      console.log(`    ${name}: (read error)`);
+    }
+  }
+
+  // Discover pairs
+  let pairs = await discoverPairs();
+  if (pairs.length === 0) {
+    console.log("\n  ❌ No active pairs found!");
+    process.exit(1);
+  }
+
+  // Map farm pools
+  pairs = await mapFarmPools(pairs);
+
+  const startTime = Date.now();
+  console.log(`\n  🎯 Starting bot with ${pairs.length} pairs × ${CFG.REPEAT_COUNT} repeats`);
+  console.log(`  📊 Estimated transactions: ~${pairs.length * CFG.REPEAT_COUNT * 5}`);
+
+  // ── Execute in order ──────────────────────────────────
+  await doAddLiquidity(pairs);
+  await doSwap(pairs);
+  await doZapAndStake(pairs);
+  await doEarn(pairs);
+  await doRemoveLiquidity(pairs);
+
+  const elapsed = ((Date.now() - startTime) / 60000).toFixed(1);
+  console.log(`\n${"═".repeat(60)}`);
+  console.log(`  🏁 ALL DONE! Total time: ${elapsed} minutes`);
+  console.log(`${"═".repeat(60)}`);
+}
+
+main().catch((e) => {
+  console.error("\n💀 FATAL:", e.message);
+  process.exit(1);
+});
